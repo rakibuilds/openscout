@@ -1,6 +1,16 @@
+
 """Typed result objects shared by OpenScout modules."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(slots=True)
+class RedirectHop:
+    """One HTTP redirect followed by the client."""
+
+    url: str
+    status_code: int
+    location: str
 
 
 @dataclass(slots=True)
@@ -12,6 +22,7 @@ class FetchResult:
     headers: dict[str, str]
     content: bytes
     elapsed_ms: float
+    redirects: list[RedirectHop] = field(default_factory=list)
 
     @property
     def content_type(self) -> str:

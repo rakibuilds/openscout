@@ -15,7 +15,7 @@ from openscout.core.exceptions import (
     NetworkAccessError,
     ResponseTooLargeError,
 )
-from openscout.core.results import FetchResult
+from openscout.core.results import FetchResult, RedirectHop
 from openscout.core.validation import validate_url
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -34,12 +34,22 @@ class WebClient:
             headers={"User-Agent": self.config.user_agent},
         )
 
-    def fetch(self, url: str) -> FetchResult:
-        """Fetch a URL while enforcing configured network restrictions."""
+    def fetch(
+        self,
+        url: str,
+        *,
+        raise_for_status: bool = True,
+    ) -> FetchResult:
+        """Fetch a URL while enforcing configured network restrictions.
+
+        Set raise_for_status=False to inspect HTTP error responses such as
+        404 and 500 without treating them as connection failures.
+        """
 
         current_url = validate_url(url)
         started_at = perf_counter()
         redirects_followed = 0
+        redirects: list[RedirectHop] = []
 
         while True:
             self._check_destination(current_url)
@@ -50,7 +60,9 @@ class WebClient:
                         location = response.headers.get("location")
 
                         if not location:
-                            response.raise_for_status()
+                            if raise_for_status:
+                                response.raise_for_status()
+
                             raise FetchError(
                                 "Redirect response did not include "
                                 "a Location header."
@@ -62,13 +74,25 @@ class WebClient:
                                 "was exceeded."
                             )
 
+                        redirects.append(
+                            RedirectHop(
+                                url=str(response.url),
+                                status_code=response.status_code,
+                                location=urljoin(
+                                    str(response.url),
+                                    location,
+                                ),
+                            )
+                        )
+
                         current_url = validate_url(
-                            urljoin(current_url, location)
+                            urljoin(str(response.url), location)
                         )
                         redirects_followed += 1
                         continue
 
-                    response.raise_for_status()
+                    if raise_for_status:
+                        response.raise_for_status()
 
                     content_length = response.headers.get("content-length")
 
@@ -110,6 +134,7 @@ class WebClient:
                         headers=dict(response.headers),
                         content=b"".join(chunks),
                         elapsed_ms=elapsed_ms,
+                        redirects=redirects,
                     )
 
             except (FetchError, NetworkAccessError):

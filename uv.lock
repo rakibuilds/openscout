@@ -468,6 +468,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
+    { name = "certifi" },
     { name = "dnspython" },
     { name = "httpx" },
     { name = "pillow" },
@@ -488,6 +489,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
+    { name = "certifi", specifier = ">=2026.10.23" },
     { name = "dnspython", specifier = ">=2.9.2" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "pillow", specifier = ">=13.0.0" },
