@@ -4,10 +4,12 @@
 import httpx
 import pytest
 
+from openscout.web.dns import InvalidDomainError
 from openscout.web.domain import (
     DomainLookupError,
     DomainNotFoundError,
     _get_rdap_base_url,
+    _parse_domain_response,
     lookup_domain,
 )
 
@@ -103,14 +105,16 @@ def test_lookup_domain_rejects_invalid_timeout():
 
 
 def test_lookup_domain_rejects_invalid_domain():
-    with pytest.raises(ValueError):
+    with pytest.raises(InvalidDomainError):
         lookup_domain("https://example.com")
 
 
 def test_lookup_domain_handles_missing_registration():
-    with make_client(domain_status=404) as client:
-        with pytest.raises(DomainNotFoundError):
-            lookup_domain("example.com", client=client)
+    with (
+        make_client(domain_status=404) as client,
+        pytest.raises(DomainNotFoundError),
+    ):
+        lookup_domain("example.com", client=client)
 
 
 def test_rdap_bootstrap_selects_correct_tld():
@@ -145,8 +149,6 @@ def test_lookup_domain_handles_missing_registrar():
         "nameservers": [],
         "events": [],
     }
-
-    from openscout.web.domain import _parse_domain_response
 
     result = _parse_domain_response(
         domain="example.com",
