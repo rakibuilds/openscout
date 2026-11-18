@@ -1,6 +1,9 @@
 
 """Local image inspection and processing operations."""
 
+import os
+import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +30,8 @@ FORMAT_EXTENSIONS = {
     "TIFF": ".tiff",
     "GIF": ".gif",
 }
+
+COMPRESSIBLE_FORMATS = {"JPEG", "PNG", "WEBP"}
 
 
 @dataclass(slots=True)
@@ -66,7 +71,7 @@ class ImageOperationResult:
 
 
 def _validate_input(path: Path) -> Path:
-    """Validate an input image path."""
+    """Validate and resolve an input image path."""
     path = path.expanduser()
 
     if not path.exists():
@@ -78,21 +83,10 @@ def _validate_input(path: Path) -> Path:
     return path.resolve()
 
 
-def _open_image(path: Path) -> Image.Image:
-    """Open and fully load an image."""
-    try:
-        with Image.open(path) as source:
-            source.load()
-            return source.copy()
-    except (
-        UnidentifiedImageError,
-        OSError,
-        ValueError,
-        Image.DecompressionBombError,
-    ) as exc:
-        raise MediaProcessingError(
-            f"Unable to read image '{path}': {exc}"
-        ) from exc
+def _validate_quality(quality: int) -> None:
+    """Validate a lossy image quality value."""
+    if not 1 <= quality <= 100:
+        raise MediaProcessingError("Quality must be between 1 and 100.")
 
 
 def _resolve_format(value: str) -> str:
@@ -102,11 +96,67 @@ def _resolve_format(value: str) -> str:
     if normalized not in SUPPORTED_FORMATS:
         supported = ", ".join(sorted(SUPPORTED_FORMATS))
         raise MediaProcessingError(
-            f"Unsupported image format '{value}'. Supported formats: {supported}"
+            f"Unsupported image format '{value}'. "
+            f"Supported formats: {supported}"
         )
 
     return SUPPORTED_FORMATS[normalized]
 
+
+def _get_image_format(image: Image.Image, source: Path) -> str:
+    """Get the detected image format, falling back to its extension."""
+    if image.format:
+        image_format = image.format
+        if image_format in FORMAT_EXTENSIONS:
+            return image_format
+
+        raise MediaProcessingError(
+            f"Unsupported image format: {image_format}"
+        )
+
+    return _resolve_format(source.suffix.lstrip("."))
+
+
+def _open_image(path: Path) -> Image.Image:
+    """Open, validate, orient, and fully load a static image."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+
+            with Image.open(path) as source:
+                frame_count = getattr(source, "n_frames", 1)
+
+                if frame_count > 1:
+                    raise MediaProcessingError(
+                        "Animated images are not supported by this operation. "
+                        "Use a static image instead."
+                    )
+
+                source.load()
+
+                oriented = ImageOps.exif_transpose(source)
+
+                try:
+                    oriented.load()
+                    result = oriented.copy()
+                    result.format = source.format
+                    return result
+                finally:
+                    if oriented is not source:
+                        oriented.close()
+
+    except MediaProcessingError:
+        raise
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
+        raise MediaProcessingError(
+            f"Unable to read image '{path}': {exc}"
+        ) from exc
 
 
 def _prepare_output(
@@ -125,7 +175,9 @@ def _prepare_output(
     extension = FORMAT_EXTENSIONS[image_format]
 
     if output is None:
-        destination = source.with_name(f"{source.stem}-{suffix}{extension}")
+        destination = source.with_name(
+            f"{source.stem}-{suffix}{extension}"
+        )
     else:
         destination = output.expanduser()
 
@@ -160,9 +212,16 @@ def _prepare_output(
             "Choose another output path."
         )
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise MediaProcessingError(
+            f"Unable to create output directory "
+            f"'{destination.parent}': {exc}"
+        ) from exc
 
     return destination, image_format
+
 
 
 def _save_image(
@@ -172,42 +231,108 @@ def _save_image(
     quality: int = 85,
     preserve_metadata: bool = False,
 ) -> None:
-    """Save an image using format-appropriate settings."""
+    """Save an image atomically without overwriting an existing file."""
     save_image = image.copy()
-    options: dict[str, object] = {}
+    temporary_path: Path | None = None
 
-    if image_format in {"JPEG", "WEBP"}:
-        if save_image.mode not in {"RGB", "L"}:
-            if save_image.mode in {"RGBA", "LA"}:
-                rgba = save_image.convert("RGBA")
-                background = Image.new("RGB", rgba.size, "white")
-                background.paste(rgba, mask=rgba.getchannel("A"))
-                save_image = background
-            else:
-                save_image = save_image.convert("RGB")
-
-        options["quality"] = quality
-
-    if image_format == "PNG":
-        options["optimize"] = True
-
-    if image_format == "WEBP":
-        options["method"] = 6
-
-    if preserve_metadata:
-        exif = image.getexif()
-        if exif:
-            options["exif"] = exif.tobytes()
+    if not preserve_metadata:
+        save_image.info.pop("icc_profile", None)
+        save_image.info.pop("exif", None)
 
     try:
-        save_image.save(destination, format=image_format, **options)
+        options: dict[str, object] = {}
+
+        if image_format in {"JPEG", "WEBP"}:
+            if save_image.mode not in {"RGB", "L"}:
+                if save_image.mode in {"RGBA", "LA"}:
+                    rgba = save_image.convert("RGBA")
+
+                    try:
+                        background = Image.new(
+                            "RGB",
+                            rgba.size,
+                            "white",
+                        )
+
+                        try:
+                            alpha = rgba.getchannel("A")
+                            try:
+                                background.paste(rgba, mask=alpha)
+                            finally:
+                                alpha.close()
+                        except Exception:
+                            background.close()
+                            raise
+                    finally:
+                        rgba.close()
+
+                    save_image.close()
+                    save_image = background
+                else:
+                    converted = save_image.convert("RGB")
+                    save_image.close()
+                    save_image = converted
+
+            options["quality"] = quality
+
+        if image_format == "PNG":
+            options["optimize"] = True
+
+        if image_format == "WEBP":
+            options["method"] = 6
+
+        if preserve_metadata:
+            exif = image.getexif()
+            if exif:
+                options["exif"] = exif.tobytes()
+
+            icc_profile = image.info.get("icc_profile")
+            if icc_profile:
+                options["icc_profile"] = icc_profile
+
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.stem}-",
+            suffix=destination.suffix,
+            dir=destination.parent,
+        )
+        os.close(file_descriptor)
+        temporary_path = Path(temporary_name)
+
+        save_image.save(
+            temporary_path,
+            format=image_format,
+            **options,
+        )
+
+        # Atomically create the destination without overwriting it.
+        try:
+            os.link(temporary_path, destination)
+        except FileExistsError as exc:
+            raise MediaProcessingError(
+                f"Output file already exists: {destination}. "
+                "Choose another output path."
+            ) from exc
+
+    except MediaProcessingError:
+        raise
     except (OSError, ValueError) as exc:
-        destination.unlink(missing_ok=True)
         raise MediaProcessingError(
             f"Unable to save image '{destination}': {exc}"
         ) from exc
     finally:
         save_image.close()
+
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as exc:
+                warnings.warn(
+                    f"Unable to remove temporary image file "
+                    f"'{temporary_path}': {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
 
 
 def _result(
@@ -215,14 +340,19 @@ def _result(
     destination: Path,
     operation: str,
 ) -> ImageOperationResult:
-    """Build a processing result."""
-    return ImageOperationResult(
-        input_path=str(source),
-        output_path=str(destination),
-        operation=operation,
-        input_size=source.stat().st_size,
-        output_size=destination.stat().st_size,
-    )
+    """Build a processing result from the completed output."""
+    try:
+        return ImageOperationResult(
+            input_path=str(source),
+            output_path=str(destination),
+            operation=operation,
+            input_size=source.stat().st_size,
+            output_size=destination.stat().st_size,
+        )
+    except OSError as exc:
+        raise MediaProcessingError(
+            f"Unable to read processing result file information: {exc}"
+        ) from exc
 
 
 def inspect_image(path: str | Path) -> ImageInfo:
@@ -230,29 +360,33 @@ def inspect_image(path: str | Path) -> ImageInfo:
     source = _validate_input(Path(path))
 
     try:
-        with Image.open(source) as image:
-            image_format = image.format or "UNKNOWN"
-            has_transparency = (
-                "A" in image.getbands()
-                or "transparency" in image.info
-            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
 
-            return ImageInfo(
-                path=str(source),
-                filename=source.name,
-                format=image_format,
-                mode=image.mode,
-                width=image.width,
-                height=image.height,
-                file_size=source.stat().st_size,
-                has_transparency=has_transparency,
-                frame_count=getattr(image, "n_frames", 1),
-            )
+            with Image.open(source) as image:
+                image_format = image.format or "UNKNOWN"
+                has_transparency = (
+                    "A" in image.getbands()
+                    or image.info.get("transparency") is not None
+                )
+
+                return ImageInfo(
+                    path=str(source),
+                    filename=source.name,
+                    format=image_format,
+                    mode=image.mode,
+                    width=image.width,
+                    height=image.height,
+                    file_size=source.stat().st_size,
+                    has_transparency=has_transparency,
+                    frame_count=getattr(image, "n_frames", 1),
+                )
     except (
         UnidentifiedImageError,
         OSError,
         ValueError,
         Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
     ) as exc:
         raise MediaProcessingError(
             f"Unable to inspect image '{source}': {exc}"
@@ -268,18 +402,24 @@ def convert_image(
 ) -> ImageOperationResult:
     """Convert an image to another supported format."""
     source = _validate_input(Path(path))
-    destination, image_format = _prepare_output(
-        source, Path(output) if output else None,
-        "converted", output_format,
-    )
+    image_format = _resolve_format(output_format)
+    _validate_quality(quality)
 
-    if not 1 <= quality <= 100:
-        raise MediaProcessingError("Quality must be between 1 and 100.")
+    destination, _ = _prepare_output(
+        source,
+        Path(output) if output is not None else None,
+        "converted",
+        image_format,
+    )
 
     image = _open_image(source)
     try:
         _save_image(
-            image, destination, image_format, quality, preserve_metadata
+            image,
+            destination,
+            image_format,
+            quality,
+            preserve_metadata,
         )
     finally:
         image.close()
@@ -293,30 +433,32 @@ def compress_image(
     quality: int = 80,
     preserve_metadata: bool = False,
 ) -> ImageOperationResult:
-    """Compress an image using format-appropriate optimization."""
+    """Compress a JPEG, PNG, or WebP image."""
     source = _validate_input(Path(path))
-
-    if not 1 <= quality <= 100:
-        raise MediaProcessingError("Quality must be between 1 and 100.")
+    _validate_quality(quality)
 
     image = _open_image(source)
-    image_format = image.format or _resolve_format(source.suffix.lstrip("."))
+    try:
+        image_format = _get_image_format(image, source)
 
-    if image_format not in {"JPEG", "PNG", "WEBP"}:
-        image.close()
-        raise MediaProcessingError(
-            "Compression currently supports JPEG, PNG, and WebP images."
+        if image_format not in COMPRESSIBLE_FORMATS:
+            raise MediaProcessingError(
+                "Compression currently supports JPEG, PNG, and WebP images."
+            )
+
+        destination, _ = _prepare_output(
+            source,
+            Path(output) if output is not None else None,
+            "compressed",
+            image_format,
         )
 
-    destination, _ = _prepare_output(
-        source,
-        Path(output) if output else None,
-        "compressed",
-    )
-
-    try:
         _save_image(
-            image, destination, image_format, quality, preserve_metadata
+            image,
+            destination,
+            image_format,
+            quality,
+            preserve_metadata,
         )
     finally:
         image.close()
@@ -343,22 +485,21 @@ def resize_image(
         raise MediaProcessingError("Width and height must be positive.")
 
     image = _open_image(source)
-    image_format = image.format or _resolve_format(source.suffix.lstrip("."))
-
-    if image_format not in FORMAT_EXTENSIONS:
-        image.close()
-        raise MediaProcessingError(f"Unsupported image format: {image_format}")
-
-    if width is None:
-        width = max(1, round(image.width * height / image.height))
-    elif height is None:
-        height = max(1, round(image.height * width / image.width))
-
-    destination, _ = _prepare_output(
-        source, Path(output) if output else None, "resized"
-    )
-
     try:
+        image_format = _get_image_format(image, source)
+
+        if width is None:
+            width = max(1, round(image.width * height / image.height))
+        elif height is None:
+            height = max(1, round(image.height * width / image.width))
+
+        destination, _ = _prepare_output(
+            source,
+            Path(output) if output is not None else None,
+            "resized",
+            image_format,
+        )
+
         resized = ImageOps.contain(
             image,
             (width, height),
@@ -366,7 +507,9 @@ def resize_image(
         )
         try:
             _save_image(
-                resized, destination, image_format,
+                resized,
+                destination,
+                image_format,
                 preserve_metadata=preserve_metadata,
             )
         finally:
@@ -395,23 +538,27 @@ def crop_image(
         )
 
     image = _open_image(source)
-    image_format = image.format or _resolve_format(source.suffix.lstrip("."))
+    try:
+        image_format = _get_image_format(image, source)
 
-    if x + width > image.width or y + height > image.height:
-        image.close()
-        raise MediaProcessingError(
-            "Crop area extends beyond the image boundaries."
+        if x + width > image.width or y + height > image.height:
+            raise MediaProcessingError(
+                "Crop area extends beyond the image boundaries."
+            )
+
+        destination, _ = _prepare_output(
+            source,
+            Path(output) if output is not None else None,
+            "cropped",
+            image_format,
         )
 
-    destination, _ = _prepare_output(
-        source, Path(output) if output else None, "cropped"
-    )
-
-    try:
         cropped = image.crop((x, y, x + width, y + height))
         try:
             _save_image(
-                cropped, destination, image_format,
+                cropped,
+                destination,
+                image_format,
                 preserve_metadata=preserve_metadata,
             )
         finally:
@@ -434,13 +581,16 @@ def create_thumbnail(
         raise MediaProcessingError("Thumbnail size must be positive.")
 
     image = _open_image(source)
-    image_format = image.format or _resolve_format(source.suffix.lstrip("."))
-
-    destination, _ = _prepare_output(
-        source, Path(output) if output else None, "thumbnail"
-    )
-
     try:
+        image_format = _get_image_format(image, source)
+
+        destination, _ = _prepare_output(
+            source,
+            Path(output) if output is not None else None,
+            "thumbnail",
+            image_format,
+        )
+
         thumbnail = ImageOps.contain(
             image,
             (size, size),
@@ -460,16 +610,20 @@ def strip_image_metadata(
     path: str | Path,
     output: str | Path | None = None,
 ) -> ImageOperationResult:
-    """Write a copy of an image without carrying over EXIF metadata."""
+    """Write a copy of an image without carrying over EXIF or ICC metadata."""
     source = _validate_input(Path(path))
+
     image = _open_image(source)
-    image_format = image.format or _resolve_format(source.suffix.lstrip("."))
-
-    destination, _ = _prepare_output(
-        source, Path(output) if output else None, "clean"
-    )
-
     try:
+        image_format = _get_image_format(image, source)
+
+        destination, _ = _prepare_output(
+            source,
+            Path(output) if output is not None else None,
+            "clean",
+            image_format,
+        )
+
         _save_image(
             image,
             destination,
