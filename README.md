@@ -104,6 +104,6 @@ Whether you want to report a problem, improve the documentation, suggest a featu
 
 **OpenScout** · Open source · Community driven
 
-Built by [Rakibul Islam](https://github.com/rakibuilds) and contributors.
+Built by [Rakibul](https://github.com/rakibuilds) and contributors.
 
 [GitHub Repository](https://github.com/rakibuilds/openscout)
