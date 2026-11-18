@@ -20,3 +20,6 @@ class NetworkAccessError(FetchError):
 
 class ResponseTooLargeError(FetchError):
     """Raised when a response exceeds the configured size limit."""
+
+class MediaProcessingError(OpenScoutError):
+    """Raised when a media processing operation fails."""

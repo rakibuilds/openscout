@@ -9,6 +9,7 @@ from rich.table import Table
 from rich.text import Text
 
 from openscout import __version__
+from openscout.cli.media import app as media_app
 from openscout.cli.web import app as web_app
 from openscout.search.explain import explain_query
 from openscout.search.operators import list_operators
@@ -30,6 +31,8 @@ search_app = typer.Typer(
     help="Build and execute advanced web searches.",
     no_args_is_help=True,
 )
+
+app.add_typer(media_app, name="media")
 
 app.add_typer(search_app, name="search")
 app.add_typer(web_app, name="web")
